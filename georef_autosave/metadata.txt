@@ -1,0 +1,15 @@
+[general]
+name=Georeferencer Autosave
+description=Automatically saves GCP points while working in the QGIS Georeferencer, preventing loss of work from crashes or accidental closure.
+version=1.0.0
+qgisMinimumVersion=3.34
+qgisMaximumVersion=4.99
+author=Harry Stranger
+email=harry@spacefromspace.com
+about=Hooks into the QGIS Georeferencer and autosaves GCP points to the standard .points file whenever changes are detected. If QGIS crashes or the Georeferencer is accidentally closed, just reopen and load GCPs as normal. Hurrah! A timestamp can be shown in the Georeferencer status bar so you always know when the last autosave fired.
+tags=georeferencer,gcp,autosave,ground control points
+homepage=
+tracker=
+repository=
+hasProcessingProvider=no
+experimental=yes
