@@ -1,21 +1,9 @@
 """
 Georeferencer Autosave Plugin
 Hooks into the QGIS Georeferencer GCP table model and autosaves the .points
-file on every change (debounced). Fully compatible with QGIS native GCP files.
-
-Architecture:
-  - A poll QTimer checks every 2s for the georeferencer window appearing/disappearing.
-  - Once found, we locate the QAbstractTableModel behind the GCP QTableView and
-    connect dataChanged / rowsInserted / rowsRemoved.
-  - Changes trigger a debounce QTimer before the actual file write; the delay
-    is read from QgsSettings each time so settings changes take effect immediately.
-  - Save path mirrors what QGIS uses (<raster>.points) unless "separate file"
-    is enabled, in which case we write <raster>_autosave.points.
-  - CRS is preserved from any existing .points file, or read from the georef
-    canvas destination CRS, so the saved file is immediately usable.
-  - A label in the Georeferencer status bar shows the last autosave timestamp.
-  - Settings are accessible from the Plugins menu and from a toolbar button
-    injected into the Georeferencer's File toolbar.
+file on every change (debounced). Output format matches the native QGIS
+.tiff.points format: comma-separated, 8 columns with header, full double
+precision, WKT2 CRS header.
 """
 
 import os
@@ -31,8 +19,28 @@ from qgis.core import QgsMessageLog, QgsApplication, Qgis
 
 from .settings_dialog import GeorefAutosaveSettingsDialog, get_setting
 
+
+import math
+
+def _fmt_float(v):
+    """
+    Format a float in fixed decimal notation with 17 significant figures.
+    Avoids scientific notation (e.g. 3.6e-12) to match the QGIS .points format
+    which always uses decimal strings (e.g. 0.00000000000363798).
+    """
+    if not isinstance(v, float):
+        return str(v)
+    if v == 0 or v != v:          # zero or NaN
+        return '0'
+    magnitude = math.floor(math.log10(abs(v)))
+    dp = max(0, 17 - magnitude - 1)
+    return f'{v:.{dp}f}'
+
 PLUGIN_NAME = "GeorefAutosave"
 POLL_MS = 2000
+
+# Header row written to every .points file
+POINTS_HEADER = "mapX,mapY,sourceX,sourceY,enable,dX,dY,residual"
 
 
 class GeorefAutosavePlugin:
@@ -43,19 +51,16 @@ class GeorefAutosavePlugin:
         self.proxy = None
         self._connected = False
 
-        # Debounce timer — delay read from settings each time it fires
         self.debounce_timer = QTimer()
         self.debounce_timer.setSingleShot(True)
         self.debounce_timer.timeout.connect(self._do_autosave)
 
-        # Poll timer — detects georef open/close
         self.poll_timer = QTimer()
         self.poll_timer.timeout.connect(self._poll_for_georef)
 
-        # UI elements we inject
-        self.status_label = None      # label in georef status bar
-        self.toolbar_action = None    # button in georef toolbar
-        self.menu_action = None       # entry in Plugins menu
+        self.status_label = None
+        self.toolbar_action = None
+        self.menu_action = None
 
     # ------------------------------------------------------------------
     # QGIS plugin lifecycle
@@ -69,34 +74,30 @@ class GeorefAutosavePlugin:
         )
         self.menu_action.triggered.connect(self._open_settings)
         self.iface.pluginMenu().addAction(self.menu_action)
-
         self.poll_timer.start(POLL_MS)
 
     def unload(self):
         self.poll_timer.stop()
         self.debounce_timer.stop()
         self._disconnect()
-
         if self.menu_action:
             self.iface.pluginMenu().removeAction(self.menu_action)
             self.menu_action = None
 
     # ------------------------------------------------------------------
-    # Settings dialog
+    # Settings
     # ------------------------------------------------------------------
 
     def _open_settings(self):
         parent = self.georef_win if self.georef_win else self.iface.mainWindow()
         dlg = GeorefAutosaveSettingsDialog(parent)
         if dlg.exec():
-            # Restart debounce timer with new delay if it's running
             if self.debounce_timer.isActive():
                 self.debounce_timer.start(get_setting("debounce_ms", int))
-            # Sync status label visibility
             self._sync_status_label_visibility()
 
     # ------------------------------------------------------------------
-    # Poll loop — detects georef open/close
+    # Poll loop
     # ------------------------------------------------------------------
 
     def _poll_for_georef(self):
@@ -111,7 +112,7 @@ class GeorefAutosavePlugin:
             self._disconnect()
 
     # ------------------------------------------------------------------
-    # Connect / disconnect GCP model signals
+    # Connect / disconnect
     # ------------------------------------------------------------------
 
     def _connect(self, win):
@@ -119,16 +120,14 @@ class GeorefAutosavePlugin:
         if not dock:
             self._log("Could not find GCP dock widget.", Qgis.MessageLevel.Warning)
             return
-
         table = dock.findChild(QTableView)
         if not table:
             self._log("Could not find GCP table view.", Qgis.MessageLevel.Warning)
             return
-
         proxy = table.model()
         source = proxy.sourceModel() if proxy else None
         if not source:
-            self._log("Could not get source model from proxy.", Qgis.MessageLevel.Warning)
+            self._log("Could not get source model.", Qgis.MessageLevel.Warning)
             return
 
         self.georef_win = win
@@ -159,9 +158,7 @@ class GeorefAutosavePlugin:
                 self.model.rowsRemoved.disconnect(self._on_rows_changed)
             except Exception:
                 pass
-
         self._remove_toolbar_button()
-
         self.model = None
         self.proxy = None
         self.georef_win = None
@@ -179,13 +176,15 @@ class GeorefAutosavePlugin:
         self.debounce_timer.start(get_setting("debounce_ms", int))
 
     # ------------------------------------------------------------------
-    # Autosave
+    # Autosave — writes format matching <raster>.tiff.points
+    #
+    # Columns: mapX,mapY,sourceX,sourceY,enable,dX,dY,residual
+    # Model:   4     5    2       3       0      6   7   8
     # ------------------------------------------------------------------
 
     def _do_autosave(self):
         if not self.model:
             return
-
         row_count = self.model.rowCount()
         if row_count == 0:
             return
@@ -193,8 +192,7 @@ class GeorefAutosavePlugin:
         raster_path = self._get_raster_path()
         if not raster_path:
             self._log(
-                "Cannot determine raster path — autosave skipped. "
-                "Open a raster in the Georeferencer first.",
+                "Cannot determine raster path — autosave skipped.",
                 Qgis.MessageLevel.Warning,
             )
             return
@@ -208,21 +206,25 @@ class GeorefAutosavePlugin:
         lines = []
         if crs_line:
             lines.append(crs_line)
+        lines.append(POINTS_HEADER)
 
         for row in range(row_count):
+            dst_x = self._get_value(row, 4)   # mapX
+            dst_y = self._get_value(row, 5)   # mapY
+            src_x = self._get_value(row, 2)   # sourceX (pixel)
+            src_y = self._get_value(row, 3)   # sourceY (pixel)
             enabled = self._get_enabled(row)
-            src_x = self._get_display(row, 2)   # pixel X
-            src_y = self._get_display(row, 3)   # pixel Y
-            dst_x = self._get_display(row, 4)   # map X
-            dst_y = self._get_display(row, 5)   # map Y
+            dx  = self._get_value(row, 6) or "0"
+            dy  = self._get_value(row, 7) or "0"
+            res = self._get_value(row, 8) or "0"
 
-            if None in (src_x, src_y, dst_x, dst_y):
+            if None in (dst_x, dst_y, src_x, src_y):
                 continue
 
-            lines.append(f"{dst_x}\t{dst_y}\t{src_x}\t{src_y}\t{enabled}")
+            lines.append(f"{dst_x},{dst_y},{src_x},{src_y},{enabled},{dx},{dy},{res}")
 
         try:
-            with open(points_path, "w", encoding="utf-8") as fh:
+            with open(points_path, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write("\n".join(lines) + "\n")
 
             ts = datetime.now().strftime("%H:%M:%S")
@@ -231,25 +233,40 @@ class GeorefAutosavePlugin:
 
             if get_setting("show_status_label", bool):
                 self._update_status_label(
-                    f"GCP autosaved at {ts}  ({row_count} point{'s' if row_count != 1 else ''})"
+                    f"GCP autosaved at {ts}  "
+                    f"({row_count} point{'s' if row_count != 1 else ''})"
                 )
-
             if get_setting("show_message_bar", bool):
                 self.iface.messageBar().pushMessage(
                     PLUGIN_NAME, msg,
                     level=Qgis.MessageLevel.Info, duration=3,
                 )
-
         except OSError as exc:
             self._log(f"Autosave write failed: {exc}", Qgis.MessageLevel.Warning)
 
     # ------------------------------------------------------------------
-    # Data extraction helpers
+    # Data extraction
     # ------------------------------------------------------------------
 
-    def _get_display(self, row, col):
+    def _get_value(self, row, col):
+        """
+        Return the best string representation of a cell value.
+        Tries EditRole first (raw Python float → full double precision).
+        Falls back to DisplayRole (pre-formatted string).
+        """
         idx = self.model.index(row, col)
-        return self.model.data(idx, Qt.ItemDataRole.DisplayRole)
+
+        edit_val = self.model.data(idx, Qt.ItemDataRole.EditRole)
+        if edit_val is not None:
+            if isinstance(edit_val, float):
+                # repr() gives the shortest string that round-trips a double
+                return _fmt_float(edit_val)
+            s = str(edit_val).strip()
+            if s:
+                return s
+
+        display_val = self.model.data(idx, Qt.ItemDataRole.DisplayRole)
+        return str(display_val).strip() if display_val is not None else None
 
     def _get_enabled(self, row):
         idx = self.model.index(row, 0)
@@ -266,8 +283,6 @@ class GeorefAutosavePlugin:
     def _get_raster_path(self):
         if not self.georef_win:
             return None
-
-        # Primary: read source from the georef canvas layer
         try:
             from qgis.gui import QgsMapCanvas
             canvas = self.georef_win.findChild(QgsMapCanvas, "georefCanvas")
@@ -280,22 +295,21 @@ class GeorefAutosavePlugin:
         except Exception as exc:
             self._log(f"Canvas layer lookup failed: {exc}", Qgis.MessageLevel.Warning)
 
-        # Fallback: parse window title "Georeferencer — /path/to/raster.tif"
+        # Fallback: parse window title
         title = self.georef_win.windowTitle()
         for sep in (" \u2014 ", " - ", "\u2014"):
             if sep in title:
                 candidate = title.split(sep, 1)[-1].strip().lstrip("*").strip()
                 if os.path.exists(candidate):
                     return candidate
-
         return None
 
     # ------------------------------------------------------------------
-    # CRS
+    # CRS — prefer WKT2 to match native QGIS .tiff.points format
     # ------------------------------------------------------------------
 
     def _get_crs_line(self, points_path):
-        # 1. Preserve from existing file
+        # 1. Preserve from existing file (keeps WKT2 if already saved)
         if os.path.exists(points_path):
             try:
                 with open(points_path, "r", encoding="utf-8") as fh:
@@ -305,21 +319,28 @@ class GeorefAutosavePlugin:
             except OSError:
                 pass
 
-        # 2. Derive from georef canvas destination CRS
+        # 2. Derive from georef canvas CRS as WKT2
         try:
             from qgis.gui import QgsMapCanvas
+            from qgis.core import QgsCoordinateReferenceSystem
             canvas = self.georef_win.findChild(QgsMapCanvas, "georefCanvas")
             if canvas:
                 crs = canvas.mapSettings().destinationCrs()
                 if crs.isValid():
-                    return f"#CRS: {crs.toWkt()}"
+                    try:
+                        wkt = crs.toWkt(
+                            QgsCoordinateReferenceSystem.WktVariant.WKT2_2019
+                        )
+                    except (AttributeError, TypeError):
+                        wkt = crs.toWkt()
+                    return f"#CRS: {wkt}"
         except Exception:
             pass
 
         return None
 
     # ------------------------------------------------------------------
-    # Georeferencer toolbar button injection
+    # Toolbar button
     # ------------------------------------------------------------------
 
     def _inject_toolbar_button(self):
@@ -349,7 +370,7 @@ class GeorefAutosavePlugin:
         self.toolbar_action = None
 
     # ------------------------------------------------------------------
-    # Georeferencer status bar label
+    # Status bar label
     # ------------------------------------------------------------------
 
     def _inject_status_label(self):
